@@ -47,6 +47,63 @@ impl<T> Sender<T> {
     }
 }
 
+/// Sender half can only be owned by one thread, but it can be cloned
+/// to send to other threads.
+pub struct SyncSender<T> {
+    inner: Arc<Inner<T>>,
+    capacity: usize,
+}
+
+impl<T> Clone for SyncSender<T> {
+    fn clone(&self) -> Self {
+        // increase senders first
+        self.inner.senders.fetch_add(1, Ordering::AcqRel);
+        Self {
+            // clone Arc explicitly
+            inner: Arc::clone(&self.inner),
+            capacity: self.capacity,
+        }
+    }
+}
+
+impl<T> Drop for SyncSender<T> {
+    fn drop(&mut self) {
+        self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+        let is_last = self.inner.get_senders() == 0;
+        if is_last {
+            self.inner.available.notify_one();
+        }
+    }
+}
+
+impl<T> SyncSender<T> {
+    /// Sends a value on this synchronous channel. This function will block
+    /// until space in the internal queue becomes available
+    pub fn send(&mut self, val: T) {
+        // TODO:
+        loop {
+            let mut queue = self.inner.queue.lock().unwrap();
+            if queue.len() <= self.capacity && self.capacity != 0 {
+                dbg!(self.capacity);
+                queue.push_back(val);
+                self.inner.available.notify_one();
+                break;
+            } else if self.capacity == 0 {
+                if let Ok(_) =
+                    self.inner
+                        .inflight
+                        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                {
+                    dbg!("compare_exchange");
+                    queue.push_back(val);
+                    self.inner.available.notify_one();
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Receiver half can only be owned by one thread.
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
@@ -81,6 +138,12 @@ impl<T> Receiver<T> {
                 Some(t) => {
                     // steal all rest elements
                     std::mem::swap(&mut self.local, &mut queue);
+                    _ = self.inner.inflight.compare_exchange(
+                        1,
+                        0,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    );
                     return Ok(t);
                 }
                 None if self.inner.get_senders() == 0 => return Err(RecvError),
@@ -102,6 +165,7 @@ struct Inner<T> {
     queue: Mutex<VecDeque<T>>,
     available: Condvar,
     senders: AtomicUsize,
+    inflight: AtomicUsize,
 }
 
 impl<T> Inner<T> {
@@ -115,6 +179,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         queue: Mutex::new(VecDeque::new()),
         available: Condvar::new(),
         senders: AtomicUsize::new(1),
+        inflight: AtomicUsize::new(0),
     };
     let inner = Arc::new(inner);
     (
@@ -128,9 +193,34 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     )
 }
 
+pub fn sync_channel<T>(capacity: usize) -> (SyncSender<T>, Receiver<T>) {
+    let mut cap = 0;
+    if capacity == 0 {
+        cap = 1
+    }
+    let inner = Inner {
+        queue: Mutex::new(VecDeque::with_capacity(cap)),
+        available: Condvar::new(),
+        senders: AtomicUsize::new(1),
+        inflight: AtomicUsize::new(0),
+    };
+    let inner = Arc::new(inner);
+    (
+        SyncSender {
+            inner: inner.clone(),
+            capacity,
+        },
+        Receiver {
+            inner: inner.clone(),
+            local: VecDeque::new(),
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{thread, time};
 
     #[test]
     fn normal_case_should_works() {
@@ -162,5 +252,38 @@ mod tests {
         drop(tx);
 
         assert!(rx.recv().is_err());
+    }
+
+    #[test]
+    fn sync_channel_should_work() {
+        let (mut tx, mut rx) = sync_channel(1);
+
+        // this returns immediately
+        tx.send(1);
+
+        thread::spawn(move || {
+            // this will block until the previous message has been received
+            tx.send(2);
+        });
+
+        assert_eq!(rx.recv(), Ok(1));
+        thread::sleep(time::Duration::from_secs(2));
+        assert_eq!(rx.recv(), Ok(2));
+    }
+
+    #[test]
+    fn rendezvous_channel_should_work() {
+        let (mut tx, mut rx) = sync_channel(0);
+
+        thread::spawn(move || {
+            println!("sending message...");
+            tx.send(1);
+            // thread is now blocked until the message is received
+
+            println!("...message received!");
+        });
+
+        thread::sleep(time::Duration::from_secs(4));
+        assert_eq!(rx.recv(), Ok(1));
     }
 }
