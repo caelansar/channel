@@ -82,10 +82,12 @@ impl<T> SyncSender<T> {
     pub fn send(&mut self, val: T) {
         // TODO:
         loop {
-            let mut queue = self.inner.queue.lock().unwrap();
-            if queue.len() <= self.capacity && self.capacity != 0 {
+            let inflight = self.inner.inflight.load(Ordering::SeqCst);
+            if inflight <= self.capacity && self.capacity != 0 {
                 dbg!(self.capacity);
+                let mut queue = self.inner.queue.lock().unwrap();
                 queue.push_back(val);
+                self.inner.senders.fetch_add(1, Ordering::AcqRel);
                 self.inner.available.notify_one();
                 break;
             } else if self.capacity == 0 {
@@ -95,7 +97,9 @@ impl<T> SyncSender<T> {
                         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 {
                     dbg!("compare_exchange");
+                    let mut queue = self.inner.queue.lock().unwrap();
                     queue.push_back(val);
+                    self.inner.senders.fetch_add(1, Ordering::AcqRel);
                     self.inner.available.notify_one();
                     break;
                 }
@@ -108,6 +112,7 @@ impl<T> SyncSender<T> {
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
     local: VecDeque<T>,
+    sync: bool,
 }
 
 #[derive(PartialEq, Debug)]
@@ -130,6 +135,9 @@ impl<T> Receiver<T> {
     /// no senders available
     pub fn recv(&mut self) -> Result<T, RecvError> {
         if let Some(t) = self.local.pop_front() {
+            if self.sync {
+                self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+            }
             return Ok(t);
         }
         let mut queue = self.inner.queue.lock().unwrap();
@@ -138,12 +146,9 @@ impl<T> Receiver<T> {
                 Some(t) => {
                     // steal all rest elements
                     std::mem::swap(&mut self.local, &mut queue);
-                    _ = self.inner.inflight.compare_exchange(
-                        1,
-                        0,
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    );
+                    if self.sync {
+                        self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+                    }
                     return Ok(t);
                 }
                 None if self.inner.get_senders() == 0 => return Err(RecvError),
@@ -189,6 +194,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         Receiver {
             inner: inner.clone(),
             local: VecDeque::new(),
+            sync: false,
         },
     )
 }
@@ -213,6 +219,7 @@ pub fn sync_channel<T>(capacity: usize) -> (SyncSender<T>, Receiver<T>) {
         Receiver {
             inner: inner.clone(),
             local: VecDeque::new(),
+            sync: true,
         },
     )
 }
