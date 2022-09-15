@@ -80,7 +80,6 @@ impl<T> SyncSender<T> {
     /// Sends a value on this synchronous channel. This function will block
     /// until space in the internal queue becomes available
     pub fn send(&mut self, val: T) {
-        // TODO:
         loop {
             let inflight = self.inner.inflight.load(Ordering::SeqCst);
             if inflight <= self.capacity && self.capacity != 0 {
@@ -292,5 +291,43 @@ mod tests {
 
         thread::sleep(time::Duration::from_secs(4));
         assert_eq!(rx.recv(), Ok(1));
+    }
+
+    #[test]
+    fn receiver_should_not_blocking() {
+        let (tx, mut rx) = channel::<()>();
+        let (mut s, mut r) = channel();
+
+        let t1 = thread::spawn(move || {
+            s.send(1);
+            assert!(rx.recv().is_err());
+        });
+
+        let t2 = thread::spawn(move || {
+            r.recv().unwrap();
+            drop(tx);
+        });
+
+        t1.join().unwrap();
+    }
+
+    #[test]
+    fn receiver_local_queue_should_work() {
+        let (mut tx, mut rx) = channel();
+        for i in 0..10usize {
+            tx.send(i);
+        }
+
+        assert!(rx.local.is_empty());
+        assert_eq!(rx.recv(), Ok(0));
+
+        assert_eq!(rx.local.len(), 9);
+        let queue = tx.inner.queue.lock().unwrap();
+        assert_eq!(queue.len(), 0);
+
+        assert_eq!(
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            rx.take(9).collect::<Vec<usize>>()
+        );
     }
 }
