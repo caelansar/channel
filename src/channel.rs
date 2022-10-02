@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Condvar, Mutex,
     },
+    time::Duration,
 };
 
 /// Sender half can only be owned by one thread, but it can be cloned
@@ -27,9 +28,8 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        self.inner.senders.fetch_sub(1, Ordering::AcqRel);
-        let is_last = self.inner.get_senders() == 0;
-        if is_last {
+        let prev = self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
             self.inner.available.notify_one();
         }
     }
@@ -68,9 +68,8 @@ impl<T> Clone for SyncSender<T> {
 
 impl<T> Drop for SyncSender<T> {
     fn drop(&mut self) {
-        self.inner.senders.fetch_sub(1, Ordering::AcqRel);
-        let is_last = self.inner.get_senders() == 0;
-        if is_last {
+        let prev = self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+        if prev <= 1 {
             self.inner.available.notify_one();
         }
     }
@@ -82,6 +81,7 @@ impl<T> SyncSender<T> {
     pub fn send(&mut self, val: T) {
         loop {
             let inflight = self.inner.inflight.load(Ordering::SeqCst);
+            // println!("inflight: {}, capacity: {}", inflight, self.capacity);
             if inflight <= self.capacity && self.capacity != 0 {
                 dbg!(self.capacity);
                 let mut queue = self.inner.queue.lock().unwrap();
@@ -135,7 +135,11 @@ impl<T> Receiver<T> {
     pub fn recv(&mut self) -> Result<T, RecvError> {
         if let Some(t) = self.local.pop_front() {
             if self.sync {
-                self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+                let prev = self.inner.inflight.fetch_sub(1, Ordering::AcqRel);
+                // make sure no negative inflight
+                if prev == 0 {
+                    self.inner.inflight.store(0, Ordering::Release);
+                }
             }
             return Ok(t);
         }
@@ -146,12 +150,28 @@ impl<T> Receiver<T> {
                     // steal all rest elements
                     std::mem::swap(&mut self.local, &mut queue);
                     if self.sync {
-                        self.inner.senders.fetch_sub(1, Ordering::AcqRel);
+                        let prev = self.inner.inflight.fetch_sub(1, Ordering::AcqRel);
+                        // make sure no negative inflight
+                        if prev == 0 {
+                            self.inner.inflight.store(0, Ordering::Release);
+                        }
                     }
                     return Ok(t);
                 }
                 None if self.inner.get_senders() == 0 => return Err(RecvError),
-                None => queue = self.inner.available.wait(queue).map_err(|_| RecvError)?,
+                None => {
+                    // sleep(Duration::from_millis(40));
+
+                    // in some edge case, `drop` may happen before `wait`
+                    // so the condition variable will never receive notification
+                    // this case is described in test `receiver_should_not_blocking`
+                    queue = self
+                        .inner
+                        .available
+                        .wait_timeout(queue, Duration::from_millis(40))
+                        .map_err(|_| RecvError)?
+                        .0
+                }
             }
         }
     }
@@ -225,6 +245,8 @@ pub fn sync_channel<T>(capacity: usize) -> (SyncSender<T>, Receiver<T>) {
 
 #[cfg(test)]
 mod tests {
+    use ntest::timeout;
+
     use super::*;
     use std::{thread, time};
 
@@ -261,6 +283,7 @@ mod tests {
     }
 
     #[test]
+    #[timeout(55)]
     fn sync_channel_should_work() {
         let (mut tx, mut rx) = sync_channel(1);
 
@@ -273,11 +296,12 @@ mod tests {
         });
 
         assert_eq!(rx.recv(), Ok(1));
-        thread::sleep(time::Duration::from_secs(2));
+        thread::sleep(time::Duration::from_millis(50));
         assert_eq!(rx.recv(), Ok(2));
     }
 
     #[test]
+    #[timeout(55)]
     fn rendezvous_channel_should_work() {
         let (mut tx, mut rx) = sync_channel(0);
 
@@ -289,7 +313,7 @@ mod tests {
             println!("...message received!");
         });
 
-        thread::sleep(time::Duration::from_secs(4));
+        thread::sleep(time::Duration::from_millis(50));
         assert_eq!(rx.recv(), Ok(1));
     }
 
@@ -303,7 +327,7 @@ mod tests {
             assert!(rx.recv().is_err());
         });
 
-        let t2 = thread::spawn(move || {
+        thread::spawn(move || {
             r.recv().unwrap();
             drop(tx);
         });
@@ -329,5 +353,12 @@ mod tests {
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
             rx.take(9).collect::<Vec<usize>>()
         );
+    }
+
+    #[test]
+    fn test_usize_overflow() {
+        let u: AtomicUsize = AtomicUsize::new(0);
+        u.fetch_sub(1usize, Ordering::Relaxed);
+        assert_eq!(18446744073709551615, u.load(Ordering::Relaxed))
     }
 }
